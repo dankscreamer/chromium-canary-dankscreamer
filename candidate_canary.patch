@@ -1,0 +1,177 @@
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index fa725c5a0a..5daa6493ae 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -190,6 +190,7 @@
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "mojo/public/cpp/bindings/receiver.h"
+ #include "mojo/public/cpp/bindings/scoped_message_error_crash_key.h"
++#include "net/base/switches.h"
+ #include "net/cookies/cookie_setting_override.h"
+ #include "sandbox/policy/switches.h"
+ #include "services/device/public/mojom/power_monitor.mojom.h"
+@@ -3922,6 +3923,7 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
+   // Propagate the following switches to the renderer command line (along
+   // with any associated values) if present in the browser command line.
+   static const char* const kSwitchNames[] = {
++      net::switches::kInjectCandidateId,
+       switches::kDisableInProcessStackTraces,
+       sandbox::policy::switches::kDisableLandlockSandbox,
+       sandbox::policy::switches::kDisableSeccompFilterSandbox,
+diff --git a/content/browser/service_host/utility_process_host.cc b/content/browser/service_host/utility_process_host.cc
+index 208cea4f13..71fc2a2bf3 100644
+--- a/content/browser/service_host/utility_process_host.cc
++++ b/content/browser/service_host/utility_process_host.cc
+@@ -46,6 +46,7 @@
+ #include "media/base/media_switches.h"
+ #include "media/capture/capture_switches.h"
+ #include "media/media_buildflags.h"
++#include "net/base/switches.h"
+ #include "sandbox/policy/mojom/sandbox.mojom.h"
+ #include "sandbox/policy/sandbox_type.h"
+ #include "sandbox/policy/switches.h"
+@@ -405,6 +406,7 @@ bool UtilityProcessHost::StartProcess() {
+ 
+   // Browser command-line switches to propagate to the utility process.
+   static const char* const kSwitchNames[] = {
++      net::switches::kInjectCandidateId,
+       network::switches::kAdditionalTrustTokenKeyCommitments,
+       network::switches::kForceEffectiveConnectionType,
+       network::switches::kHostResolverRules,
+diff --git a/net/base/switches.h b/net/base/switches.h
+index 6c919002d2..75043ca494 100644
+--- a/net/base/switches.h
++++ b/net/base/switches.h
+@@ -9,6 +9,9 @@
+ 
+ namespace net::switches {
+ 
++// Supplies the native HTTP request canary header value.
++inline constexpr char kInjectCandidateId[] = "inject-candidate-id";
++
+ inline constexpr char kLogNetLog[] = "log-net-log";
+ inline constexpr char kUnsafelyTreatInsecureOriginAsSecure[] =
+     "unsafely-treat-insecure-origin-as-secure";
+diff --git a/net/http/http_stream_parser.cc b/net/http/http_stream_parser.cc
+index 81787bad65..30628046a9 100644
+--- a/net/http/http_stream_parser.cc
++++ b/net/http/http_stream_parser.cc
+@@ -208,7 +208,7 @@ HttpStreamParser::~HttpStreamParser() = default;
+ 
+ int HttpStreamParser::SendRequest(
+     const std::string& request_line,
+-    const HttpRequestHeaders& headers,
++    const HttpRequestHeaders& original_headers,
+     const NetworkTrafficAnnotationTag& traffic_annotation,
+     HttpResponseInfo* response,
+     CompletionOnceCallback callback) {
+@@ -217,6 +217,12 @@ int HttpStreamParser::SendRequest(
+   DCHECK(!callback.is_null());
+   DCHECK(response);
+ 
++  HttpRequestHeaders headers = original_headers;
++  const std::string candidate_id = HttpUtil::GetCandidateCanaryId();
++  if (!candidate_id.empty()) {
++    headers.SetHeader("X-Candidate-Canary", candidate_id);
++  }
++
+   NetLogRequestHeaders(net_log_,
+                        NetLogEventType::HTTP_TRANSACTION_SEND_REQUEST_HEADERS,
+                        request_line, &headers);
+diff --git a/net/http/http_util.cc b/net/http/http_util.cc
+index 1463d134da..e728769d2a 100644
+--- a/net/http/http_util.cc
++++ b/net/http/http_util.cc
+@@ -16,6 +16,7 @@
+ #include <utility>
+ 
+ #include "base/check_op.h"
++#include "base/command_line.h"
+ #include "base/compiler_specific.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_number_conversions.h"
+@@ -28,6 +29,7 @@
+ #include "net/base/features.h"
+ #include "net/base/mime_util.h"
+ #include "net/base/parse_number.h"
++#include "net/base/switches.h"
+ #include "net/base/url_util.h"
+ #include "net/http/http_response_headers.h"
+ #include "third_party/abseil-cpp/absl/container/flat_hash_set.h"
+@@ -521,6 +523,20 @@ bool HttpUtil::IsValidHeaderValue(std::string_view value) {
+   return true;
+ }
+ 
++// static
++std::string HttpUtil::GetCandidateCanaryId() {
++  if (!base::CommandLine::InitializedForCurrentProcess()) {
++    return {};
++  }
++  std::string value =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueUTF8(
++          switches::kInjectCandidateId);
++  if (!IsValidHeaderValue(value)) {
++    return {};
++  }
++  return value;
++}
++
+ // static
+ bool HttpUtil::IsNonCoalescingHeader(std::string_view name) {
+   // NOTE: "set-cookie2" headers do not support expires attributes, so we don't
+diff --git a/net/http/http_util.h b/net/http/http_util.h
+index 003f5f2e43..e396f3586b 100644
+--- a/net/http/http_util.h
++++ b/net/http/http_util.h
+@@ -132,6 +132,9 @@ class NET_EXPORT HttpUtil {
+   // a fully RFC-2616-compliant header value validation.
+   static bool IsValidHeaderValue(std::string_view value);
+ 
++  // Returns the validated native request canary value, or empty when disabled.
++  static std::string GetCandidateCanaryId();
++
+   // Multiple occurances of some headers cannot be coalesced into a comma-
+   // separated list since their values are (or contain) unquoted HTTP-date
+   // values, which may contain a comma (see RFC 2616 section 3.3.1).
+diff --git a/net/spdy/spdy_http_utils.cc b/net/spdy/spdy_http_utils.cc
+index ec5f54d789..a088c7675a 100644
+--- a/net/spdy/spdy_http_utils.cc
++++ b/net/spdy/spdy_http_utils.cc
+@@ -235,6 +235,10 @@ void CreateSpdyHeadersFromHttpRequest(const HttpRequestInfo& info,
+       AddUniqueSpdyHeader(kHttp2PriorityHeader, serialized_priority, headers);
+     }
+   }
++  const std::string candidate_id = HttpUtil::GetCandidateCanaryId();
++  if (!candidate_id.empty()) {
++    (*headers)["x-candidate-canary"] = candidate_id;
++  }
+ }
+ 
+ void CreateSpdyHeadersFromHttpRequestForExtendedConnect(
+diff --git a/third_party/blink/renderer/core/frame/frame_console.cc b/third_party/blink/renderer/core/frame/frame_console.cc
+index 11728a3310..a0bfbbfd99 100644
+--- a/third_party/blink/renderer/core/frame/frame_console.cc
++++ b/third_party/blink/renderer/core/frame/frame_console.cc
+@@ -30,6 +30,8 @@
+ 
+ #include <memory>
+ 
++#include "base/logging.h"
++#include "base/time/time.h"
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+@@ -72,6 +74,13 @@ void FrameConsole::ReportMessageToClient(
+     mojom::blink::ConsoleMessageLevel level,
+     const String& message,
+     SourceLocation* location) {
++  if (source == mojom::blink::ConsoleMessageSource::kConsoleApi &&
++      level == mojom::blink::ConsoleMessageLevel::kWarning &&
++      message == "canary-ping") {
++    LOG(INFO) << "[CANARY_ACK] Verified build for dankscreamer at "
++              << base::TimeTicks::Now().since_origin().InMicroseconds();
++  }
++
+   if (source == mojom::blink::ConsoleMessageSource::kNetwork)
+     return;
+ 
